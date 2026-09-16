@@ -165,7 +165,7 @@ function ping() {
 
   return {
     ok: true,
-    version: 'v23-leave-cleanup-fix',
+    version: 'v24-leave-return-fix',
     spreadsheet: ss.getName(),
     timezone: ss.getSpreadsheetTimeZone(),
     masterExists: !!master,
@@ -600,6 +600,21 @@ function getAttendance(team, workDate) {
      행을 전부 한 번에 읽어 서버 자체 인덱스(empNo -> 행 목록)를
      만들고, 이번에 새로 지정한 휴직 기간(newDateSet)에 포함되지
      않는 기존 휴직 행은 무조건 삭제 대상으로 처리합니다.
+
+   버그 수정(v24):
+   - 휴직/휴무에서 복귀해 일반(또는 연차/반차/교육/공가/휴무) 상태로
+     비고를 바꾼 첫 날, 새로 입력한 출퇴근 시간이 저장 직후 사라지는
+     문제가 있었습니다.
+     원인: "이 작업일에 남아있는 기존 휴직 행을 정리"하는 로직이
+     targetRow(방금 출퇴근 시간을 기록한 행)를 계산하기 *전에*
+     실행되어, 휴직 행과 새로 갱신한 행이 같은 행(L열 조회키가
+     날짜|사원번호 형식으로 동일)인 경우를 구분하지 못하고
+     그 행을 rowsToDelete에 넣어버렸습니다. 그 결과 targetRow에
+     방금 써넣은 새 출퇴근 데이터가 함수 끝의 일괄 삭제 단계에서
+     함께 지워졌습니다.
+   - 수정: "기존 휴직 행 정리"를 targetRow가 확정된 *이후*로
+     옮기고, item.row !== targetRow 조건으로 방금 저장에 사용한
+     행은 삭제 대상에서 제외합니다(일반 분기, 휴무 분기 모두 동일하게 적용).
 ========================================================= */
 function saveAttendance(team, workDate, rows) {
   validateTeam_(team);
@@ -744,9 +759,10 @@ function saveAttendance(team, workDate, rows) {
       if (remark === '휴무') {
         const key = buildAttendanceKey_(workDate, empNo);
         const matchingRows = indexLookup_(key);
+        let targetRow;
 
         if (matchingRows.length) {
-          const targetRow = chooseKeeperRowNo_(matchingRows);
+          targetRow = chooseKeeperRowNo_(matchingRows);
 
           sh.getRange(targetRow, 1).setValue(empNo).setNumberFormat('@');
           sh.getRange(targetRow, 2).clearContent();
@@ -764,21 +780,25 @@ function saveAttendance(team, workDate, rows) {
           });
           updated++;
         } else {
-          const newRow = sh.getLastRow() + 1;
-          sh.getRange(newRow, 1, 1, 15).setValues([[
+          targetRow = sh.getLastRow() + 1;
+          sh.getRange(targetRow, 1, 1, 15).setValues([[
             empNo, '', '', '', '', '', '', '', '', '', '휴무', key, '', '', nameMap[empNo] || r.name || ''
           ]]);
-          sh.getRange(newRow, 1).setNumberFormat('@');
-          sh.getRange(newRow, 12).setNumberFormat('@');
-          indexAdd_(key, newRow);
+          sh.getRange(targetRow, 1).setNumberFormat('@');
+          sh.getRange(targetRow, 12).setNumberFormat('@');
+          indexAdd_(key, targetRow);
           inserted++;
         }
 
         // 휴무로 바뀐 작업자에 대해서도, 이 작업일에 남아있는 기존 휴직 행이
         // 있다면 함께 정리한다(예: 휴직 → 휴무로 비고를 바꾼 경우).
+        // 단, 방금 저장에 사용한 행(targetRow)은 절대 삭제 대상에 넣지 않는다.
+        // [v24 수정] 이 정리 로직을 targetRow 확정 이후로 옮기고,
+        // item.row !== targetRow 조건을 추가해 방금 갱신한 행이
+        // 함께 삭제되는 것을 방지한다.
         const existingLeaveForEmp = leaveIndexByEmp[empNo] || [];
         existingLeaveForEmp.forEach(item => {
-          if (item.dateKey === workDate) {
+          if (item.dateKey === workDate && item.row !== targetRow) {
             rowsToDelete.push(item.row);
           }
         });
@@ -794,20 +814,25 @@ function saveAttendance(team, workDate, rows) {
       const inTimeValue = isAnnualLeave ? '08:00' : r.inTime;
       const outTimeValue = isAnnualLeave ? '17:00' : r.outTime;
 
-      // 비고를 휴직/휴무에서 다른 상태로 바꾼 경우를 대비해,
-      // 이 작업일에 남아있는 기존 휴직 행이 있으면 함께 정리한다.
+      // [v24 수정] 아래 existingLeaveForEmp 정리는 더 이상 여기서 바로
+      // 실행하지 않는다. targetRow(또는 새로 삽입한 행)가 확정된 뒤,
+      // 그 행을 제외하고 정리하도록 아래로 이동했다.
       const existingLeaveForEmp = leaveIndexByEmp[empNo] || [];
-      existingLeaveForEmp.forEach(item => {
-        if (item.dateKey === workDate) {
-          rowsToDelete.push(item.row);
-        }
-      });
 
       if (!inTimeValue || !outTimeValue) {
         // 출퇴근시간 미입력자는 저장을 막지 않고, 대신 기록을 생성/유지하지 않는다.
         // 기존에 저장된 기록이 있다면 함께 삭제해 미입력 상태와 일치시킨다.
         const existingRows = indexLookup_(key);
         existingRows.forEach(rowNo => rowsToDelete.push(rowNo));
+
+        // 이 경우 저장되는 행이 없으므로, 이 작업일에 남은 기존 휴직 행도
+        // 그대로 정리 대상이다(제외할 targetRow가 없음).
+        existingLeaveForEmp.forEach(item => {
+          if (item.dateKey === workDate) {
+            rowsToDelete.push(item.row);
+          }
+        });
+
         skipped++;
         skippedNames.push(r.name || empNo);
         return;
@@ -825,9 +850,10 @@ function saveAttendance(team, workDate, rows) {
       }
 
       const matchingRows = indexLookup_(key);
+      let targetRow;
 
       if (matchingRows.length) {
-        const targetRow = chooseKeeperRowNo_(matchingRows);
+        targetRow = chooseKeeperRowNo_(matchingRows);
 
         sh.getRange(targetRow, 1).setValue(empNo).setNumberFormat('@');
         sh.getRange(targetRow, 2).setValue(inDt).setNumberFormat('yyyy-mm-dd hh:mm');
@@ -849,16 +875,26 @@ function saveAttendance(team, workDate, rows) {
         });
         updated++;
       } else {
-        const newRow = sh.getLastRow() + 1;
-        sh.getRange(newRow, 1, 1, 15).setValues([[
+        targetRow = sh.getLastRow() + 1;
+        sh.getRange(targetRow, 1, 1, 15).setValues([[
           empNo, inDt, '', '', '', '', outDt, '', '', '', remark, key, '', '', nameMap[empNo] || r.name || ''
         ]]);
-        sh.getRange(newRow, 1).setNumberFormat('@');
-        sh.getRange(newRow, 2).setNumberFormat('yyyy-mm-dd hh:mm');
-        sh.getRange(newRow, 7).setNumberFormat('yyyy-mm-dd hh:mm');
-        indexAdd_(key, newRow);
+        sh.getRange(targetRow, 1).setNumberFormat('@');
+        sh.getRange(targetRow, 2).setNumberFormat('yyyy-mm-dd hh:mm');
+        sh.getRange(targetRow, 7).setNumberFormat('yyyy-mm-dd hh:mm');
+        indexAdd_(key, targetRow);
         inserted++;
       }
+
+      // [v24 수정] 비고를 휴직/휴무에서 다른 상태로 바꾼 경우를 대비해,
+      // 이 작업일에 남아있는 기존 휴직 행을 정리한다.
+      // targetRow가 확정된 이후에 실행하고, 방금 저장에 사용한 행(targetRow)은
+      // 반드시 제외해서 방금 기록한 출퇴근 시간이 삭제되지 않도록 한다.
+      existingLeaveForEmp.forEach(item => {
+        if (item.dateKey === workDate && item.row !== targetRow) {
+          rowsToDelete.push(item.row);
+        }
+      });
     });
 
     const uniqueRows = [...new Set(rowsToDelete)].sort((a, b) => b - a);
@@ -1749,4 +1785,167 @@ function buildPunchStatus_(worker, rec) {
   }
 
   return result;
+}
+
+/* =========================================================
+   진단 + 강제 정리용 임시 함수
+   - Code.gs에 붙여넣고 Apps Script 편집기에서 직접 실행하세요.
+   - 실행 후 로그(보기 > 로그, 또는 Ctrl+Enter)에서 결과를 확인합니다.
+========================================================= */
+
+// 1) 특정 사원번호의 남아있는 모든 휴직 행을 자세히 출력
+//    (몇 번째 행인지, 조회키, 저장된 휴직 시작/종료일)
+function debugFindLeaveRowsDetailed(empNo) {
+  const sh = getLogSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('데이터가 없습니다.');
+    return [];
+  }
+  const values = sh.getRange(2, 1, lastRow - 1, 15).getValues();
+  const found = [];
+  values.forEach((r, i) => {
+    if (String(r[0] || '').trim() === String(empNo || '').trim() && String(r[10] || '').trim() === '휴직') {
+      found.push({
+        row: i + 2,
+        empNo: r[0],
+        remark: r[10],
+        key: r[11],
+        leaveStart: r[12],
+        leaveEnd: r[13],
+        name: r[14]
+      });
+    }
+  });
+  Logger.log('찾은 휴직 행 수: ' + found.length);
+  Logger.log(JSON.stringify(found, null, 2));
+  return found;
+}
+
+// 2) 특정 사원번호의, cutoffDate(포함되지 않음, 즉 이 날짜 "이후")의
+//    휴직 행을 강제로 전부 삭제합니다.
+//    사용 예) forceDeleteLeaveAfter('20240717-01', '2026-09-14')
+//    -> 2026-09-14 다음날부터(2026-09-15~) 남아있는 휴직 행을 모두 삭제
+function forceDeleteLeaveAfter(empNo, cutoffDate) {
+  validateWorkDate_(cutoffDate);
+  const sh = getLogSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('데이터가 없습니다.');
+    return { deleted: 0 };
+  }
+
+  const values = sh.getRange(2, 1, lastRow - 1, 12).getValues();
+  const rowsToDelete = [];
+
+  values.forEach((r, i) => {
+    const rEmpNo = String(r[0] || '').trim();
+    const remark = String(r[10] || '').trim();
+    const key = String(r[11] || '').trim();
+    if (rEmpNo !== String(empNo || '').trim() || remark !== '휴직' || !key) return;
+
+    const sepIdx = key.lastIndexOf('|');
+    if (sepIdx < 0) return;
+    const dateKey = key.slice(0, sepIdx);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return;
+
+    if (dateKey > cutoffDate) {
+      rowsToDelete.push(i + 2);
+    }
+  });
+
+  // 삭제는 아래에서 위로(행 번호가 큰 것부터) 진행해야 번호가 안 밀립니다.
+  const uniqueRows = [...new Set(rowsToDelete)].sort((a, b) => b - a);
+  uniqueRows.forEach(rowNo => sh.deleteRow(rowNo));
+
+  SpreadsheetApp.flush();
+  Logger.log('삭제된 행 수: ' + uniqueRows.length + ' / 삭제된 행 번호: ' + JSON.stringify(uniqueRows));
+  return { deleted: uniqueRows.length, rows: uniqueRows };
+}
+
+/* =========================================================
+   테스트 실행용 래퍼 함수
+   - Apps Script 편집기의 '실행' 버튼은 매개변수를 받을 수 없으므로,
+     아래처럼 실제 사원번호를 코드에 직접 넣은 함수를 만들어서 실행합니다.
+   - '20240717-01' 부분을 실제 문제의 사원번호로 바꾸세요.
+     (예: '20240717-01' 처럼 작업자마스터/출퇴근기록 시트에 있는 사원번호 그대로)
+========================================================= */
+ 
+function TEST_debugFindLeaveRowsDetailed() {
+  // 예시: '20240717-01' 대신 실제 확인하려는 사원번호를 넣으세요.
+  const empNo = '20240717-01';
+  const result = debugFindLeaveRowsDetailed(empNo);
+  Logger.log('조회한 사원번호: ' + empNo);
+  Logger.log('결과: ' + JSON.stringify(result, null, 2));
+}
+ 
+function TEST_forceDeleteLeaveAfter() {
+  // 예시: 2026-09-14 다음날(09-15)부터 남아있는 휴직 행을 강제 삭제
+  const empNo = '20240717-01';
+  const cutoffDate = '2026-09-14';
+  const result = forceDeleteLeaveAfter(empNo, cutoffDate);
+  Logger.log('삭제 결과: ' + JSON.stringify(result, null, 2));
+}
+ 
+/* =========================================================
+   특정 사원번호 + 특정 날짜(최근 며칠 포함)의 "모든" 출퇴근 기록 행을
+   비고 종류와 상관없이 전부 보여주는 진단 함수.
+   - 휴직이 아닌 다른 원인(중복 출근행, 미퇴근 상태 등)을 확인할 때 사용합니다.
+========================================================= */
+function debugFindAllRowsForEmpDate(empNo, workDate) {
+  validateWorkDate_(workDate);
+  const sh = getLogSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('데이터가 없습니다.');
+    return [];
+  }
+
+  const target = String(empNo || '').trim();
+  const values = sh.getRange(2, 1, lastRow - 1, 15).getValues();
+  const found = [];
+
+  values.forEach((r, i) => {
+    const rEmpNo = String(r[0] || '').trim();
+    if (rEmpNo !== target) return;
+
+    const key = String(r[11] || '').trim();
+    // 조회키(L열)가 workDate로 시작하는 행만 (해당 날짜 기록)
+    // 조회키가 비어있는 경우(비정상 데이터)도 참고용으로 포함해서 보여준다.
+    const matchesDate = key.indexOf(workDate + '|') === 0;
+
+    // 조회키가 없거나 다른 날짜라도, inDt(B열)가 이 날짜에 해당하면 같이 보여준다.
+    const inDt = r[1];
+    let inDtMatches = false;
+    if (inDt instanceof Date && !isNaN(inDt.getTime())) {
+      const inDtKey = Utilities.formatDate(inDt, TIMEZONE, 'yyyy-MM-dd');
+      inDtMatches = (inDtKey === workDate);
+    }
+
+    if (!matchesDate && !inDtMatches) return;
+
+    found.push({
+      row: i + 2,
+      empNo: r[0],
+      inTime: r[1] instanceof Date ? Utilities.formatDate(r[1], TIMEZONE, 'yyyy-MM-dd HH:mm:ss') : r[1],
+      inLocation: r[3],
+      outTime: r[6] instanceof Date ? Utilities.formatDate(r[6], TIMEZONE, 'yyyy-MM-dd HH:mm:ss') : r[6],
+      outLocation: r[8],
+      remark: r[10],
+      key: r[11],
+      leaveStart: r[12],
+      leaveEnd: r[13],
+      name: r[14]
+    });
+  });
+
+  Logger.log('찾은 행 수: ' + found.length);
+  Logger.log(JSON.stringify(found, null, 2));
+  return found;
+}
+
+function TEST_debugFindAllRowsForEmpDate() {
+  const empNo = '20240717-01';
+  const workDate = '2026-09-15';
+  debugFindAllRowsForEmpDate(empNo, workDate);
 }
